@@ -2,7 +2,7 @@
 	===========================================================================                               
            Filename: Application.m
                Date: Sep 29th, 2022
-        Last update: Dec 11th, 2023   
+        Last update: Dec 12th, 2023   
 
         CC BY-NC-SA 3.0 (http://creativecommons.org/licenses/by-nc-sa/3.0/)
 	===========================================================================
@@ -24,6 +24,8 @@ classdef Application < handle
         learningRates, weigths, scales, shifts, feedbacks, feedforwards
         eMemory, zMemory, yMemory, fMemory, dMemory, gamma, wave
         
+        mGamma, tDisturbance
+        
         % Fileparameters
         prefix, fWeights, fShifts, fScales, fBacks, fForwards, reqTime
         fWavelets, fNormErrs
@@ -36,9 +38,6 @@ classdef Application < handle
     methods (Access = public)
         %{
             Setting the parameters proposed by the designer
-        
-            @params integer $type Control type
-            @return the object object created
         %}
         function this = Application()
             clc, close all
@@ -54,7 +53,8 @@ classdef Application < handle
             this.fTime  = 15;                           % Simulation time, seconds
             this.fixed  = [deg2rad(5), deg2rad(10)];    % Values for a fixed trajectory
             this.posPitch = deg2rad([-30 0 0 0]);
-            this.posYaw   = deg2rad([0 0 20 20 0 0]);
+            this.posYaw   = deg2rad([0 0 20 20 20 20]);
+            this.tDisturbance = 6;                      % seconds
             
             % WaveNet-IIR parameters
             this.inputs  = 2;       % System's input
@@ -66,13 +66,13 @@ classdef Application < handle
             this.learningRates = [3e-8 3e-8 3e-8 5e-8 5e-5];
             
             % Setting PID Controller parameters and its update rates
-            this.prefix  = 'AC-PID-PertCte';
+            this.prefix  = 'AC-PID-WNet-MassDisturbance';
             this.inputs  = this.inputs + 1;
             this.outputs = this.outputs + 1;
             
             this.gains = [100 0.5 10; 100 0.5 10];
             this.gains = 0.8 * this.gains;
-            this.updateRates = [5, 0.001, 1; 5, 0.001, 1];
+            this.updateRates = [1 0.001 1; 1 0.001 1];
             
             this.prefix = [this.prefix '-' this.wave];
             
@@ -113,6 +113,8 @@ classdef Application < handle
             this.states = zeros(this.samples,4);
             this.states(1,1) = -0.70;    
             this.signals = [0,0];
+            
+            this.mGamma = zeros(this.samples,4);
         end
         
         %{
@@ -145,7 +147,7 @@ classdef Application < handle
             [~, dYaw, ~] = ...
                 Application.createTrajectory(this.period, this.fTime, refYaw);
             
-            this.desired = [dPitch dYaw];            
+            this.desired = [dPitch dYaw];
         end
         
         %{
@@ -170,15 +172,13 @@ classdef Application < handle
                 uy = Application.getCtrlSignal(this.signals(2), this.gains(2,:), ...
                     this.eMemory(:,2));
                 
-                this.signals = [up uy] + [0.75 0];
+                this.signals = [up uy];
                 
                 % Position "mesaured" from linear or nonlinear models
-                this.states = Application.NonlinearModel(this.states, ...
-                    this.signals, idx, this.period);
-                yMes = [this.states(idx,1), this.states(idx,3)];
-                
-                [modelRho, modelGamma] = Application.ModelEq(this.states, this.signals,...
-                    idx, this.period);
+                [this.states, modelRho, modelGamma] = Application.NonlinearModel(...
+                    this.states, this.signals, idx, this.period, this.tDisturbance);
+                yMes = [this.states(idx,1), this.states(idx,3)];                
+                this.mGamma(idx,1:2) = modelGamma;
                 
                 % Calculating of Wavelets and WaveNet
                 [tau, func, dfunc] = this.activac.funcOutputs(kT, this.shifts, this.scales);
@@ -191,6 +191,8 @@ classdef Application < handle
                 tempZ = [wNetOutputs; this.zMemory(1:this.coeffsM-1,1:2)];
                 [actor, Rho, Gamma] = Application.getOutputFilters(this.feedbacks, ...
                     this.feedforwards, tempZ, this.yMemory(:,1:2), this.pSignal);
+                
+                this.mGamma(idx,3:4) = Gamma;
                 
                 error   = yMes - actor;                         % Estimation error
                 epsilon = yRef - yMes;                          % Tracking error
@@ -226,11 +228,6 @@ classdef Application < handle
                 this.scales       = this.scales - this.learningRates(3)*da;
                 this.feedbacks    = this.feedbacks - this.learningRates(4)*dC;
                 this.feedforwards = this.feedforwards - this.learningRates(5)*dD;
-                
-                % RL-WNet parameters normalization
-                if idx == 1
-                    this.weigths = Application.normAB(this.weigths,-1,1);
-                end
                 
                 % Update rules for controllers
                 if this.isTraining
@@ -268,10 +265,11 @@ classdef Application < handle
         end
         
         %{
-            @param integer $idx
+            Shows the simulation information every timestep.
+        
+            @param integer $idx     Stands of the current iteration.
         %}
         function logger(self, idx)
-            % Logger => Create a function
             clc
             data = self.behavior(idx,:);
             
@@ -296,15 +294,17 @@ classdef Application < handle
             Calls the functions to create the graphics.
         %}
         function plotResults(this)
-            this.showTrackingResults()
-%             this.showIdentifResults()
             this.showNeuronsParams()
             this.showWeights()
             this.showGains()
             this.showNormError()
             this.showSignalsRL()
+            this.showTrackingResults()
         end
         
+        %{
+            Print the simulation results for desired positions.
+        %}
         function showTrackingResults(this)
             kT = this.behavior(:,1);
             
@@ -317,14 +317,18 @@ classdef Application < handle
                 plot(kT,this.behavior(:,4),'r','LineWidth',1)
                 title('Pitch')
                 ylabel('Position, y [grad]')
-                legend('Reference','Measured')
+                legend('Reference','Real')
+                xline(this.tDisturbance,'-.','DisplayName','Disturbance 1.5 mass')
+                
             subplot(3,2,3)
-                plot(kT,this.behavior(:,8),'r','LineWidth',1);
+                plot(kT,this.behavior(:,8),'r','LineWidth',1)
                 ylabel('Error [grad]')
             subplot(3,2,5)
-                plot(kT,this.behavior(:,12),'r','LineWidth',1);
-                ylabel('Señal de control, u_\theta [V]')
+                hold on
+                plot(kT,this.behavior(:,12),'r','LineWidth',1)
+                ylabel('Input signal [Nm]')
                 xlabel('Time, kT [sec]')
+                legend('\tau')
                 
             subplot(3,2,2)
                 hold on
@@ -332,43 +336,23 @@ classdef Application < handle
                 plot(kT,this.behavior(:,5),'r','LineWidth',1)
                 title('Yaw')
                 ylabel('Position, y [grad]')
-                legend('Reference','Measured')
+                legend('Reference','Real')
+                xline(this.tDisturbance,'-.','DisplayName','Coupling pertubation')
+                
             subplot(3,2,4)
-                plot(kT,this.behavior(:,9),'r','LineWidth',1);
+                plot(kT,this.behavior(:,9),'r','LineWidth',1)
                 ylabel('Error [grad]')
             subplot(3,2,6)
-                plot(kT,this.behavior(:,13),'r','LineWidth',1);
-                ylabel('Señal de control, u_\theta [V]')
+                hold on
+                plot(kT,this.behavior(:,13),'r','LineWidth',1)
+                ylabel('Input signal [Nm]')
                 xlabel('Time, kT [sec]')
+                legend('\tau')
         end
         
-        function showIdentifResults(this)
-            kT = this.behavior(:,1);
-            
-            figure('Name','Approximation results','NumberTitle','off','units',...
-                'normalized','outerposition',[0 0 1 1]);
-            
-            subplot(2,2,1)
-                hold on
-                plot(kT,this.behavior(:,4),'k--','LineWidth',1)
-                plot(kT,this.behavior(:,6),'r','LineWidth',1)
-                ylabel('Position, y [grad]')
-                legend('Measured','Estimated')
-            subplot(2,2,3)
-                plot(kT,this.behavior(:,10),'r','LineWidth',1);
-                ylabel('Error [grad]')
-                
-            subplot(2,2,2)
-                hold on
-                plot(kT,this.behavior(:,5),'k--','LineWidth',1)
-                plot(kT,this.behavior(:,7),'r','LineWidth',1)
-                ylabel('Position, y [grad]')
-                legend('Measured','Estimated')
-            subplot(2,2,4)
-                plot(kT,this.behavior(:,11),'r','LineWidth',1);
-                ylabel('Error [grad]')
-        end
-        
+        %{
+            Shows the behavior of neuron parameters and their outputs.
+        %}
         function showNeuronsParams(this)
             kT = this.behavior(:,1);
             
@@ -397,6 +381,9 @@ classdef Application < handle
             end
         end
         
+        %{
+            Shows the gains behavior from controllers.
+        %}
         function showGains(this)
             kT = this.behavior(:,1);
             
@@ -406,6 +393,7 @@ classdef Application < handle
             subplot(3,2,1)
                 plot(kT, this.behavior(:,14),'r','LineWidth',1)
                 ylabel('Proportional, k_{p_\theta}')
+                title('Pitch')
                 
             subplot(3,2,3)
                 plot(kT, this.behavior(:,15),'r','LineWidth',1)
@@ -418,6 +406,7 @@ classdef Application < handle
             subplot(3,2,2)
                 plot(kT, this.behavior(:,17),'r','LineWidth',1)
                 ylabel('Proportional, k_{p_\phi}')
+                title('Yaw')
                 
             subplot(3,2,4)
                 plot(kT, this.behavior(:,18),'r','LineWidth',1)
@@ -444,6 +433,9 @@ classdef Application < handle
                 xlabel('Time, kT [s]')
         end
         
+        %{
+            Shows the synaptic weights behavior of the WaveNet-IIR.
+        %}
         function showWeights(this)
             kT = this.behavior(:,1);
             
@@ -468,6 +460,9 @@ classdef Application < handle
             end
         end
         
+        %{
+            Plots the critic, reward and temporal difference signals.
+        %}
         function showSignalsRL(this)
             kT = this.behavior(:,1);
             
@@ -486,6 +481,9 @@ classdef Application < handle
             xlabel('Time, kT [s]')
         end
         
+        %{
+            Saves the similation results into CSV files.
+        %}
         function saveCSV(this)
             writematrix(this.weigths,       ['csv-files/' this.prefix ' weights.csv'])
             writematrix(this.weigths,       ['csv-files/' this.prefix ' weights.csv'])
@@ -651,7 +649,8 @@ classdef Application < handle
                     double $period      Sampling time
             @return array  $newState    Angular accelarations estimated about each axis
         %}
-        function newState = NonlinearModel(states, signals, idx, period)
+        function [newState, rho, gamma] = NonlinearModel(states, signals, idx, period,...
+                tDisturbance)
             % Set constants
             m   = 1.3872;
             g   = 9.8100;
@@ -664,96 +663,12 @@ classdef Application < handle
             Kyy = 0.0720;
             Kyp = 0.0219;
             Kpy = 0.0068;
-
-            % States
-            x1 = states(idx,1);
-            x2 = states(idx,2);
-            x4 = states(idx,4);
-
-            % Differential Equations (Nonlinear model)
-            % Representation in state variables
-            f1 = -(Bp*x2 + m*(x2*l)^2*sin(x1)*cos(x1) + m*g*l*cos(x1))/(Jp + m*l^2);
-            f2 = -(By*x4 + 2*m*sin(x1)*cos(x1)*x2*x4*l^2)/(Jy + m*(l*cos(x1))^2);
-
-            g11 = Kpp/(Jp + m*l^2);
-            g12 = Kpy/(Jp + m*l^2);
-            g21 = Kyp/(Jy + m*(l*cos(x1))^2);
-            g22 = Kyy/(Jy + m*(l*cos(x1))^2);
-
-            f = [x2; f1; x4; f2];
-            g = [0,0; g11,g12; 0,0; g21,g22];
-            u = [signals(1); signals(2)];
-
-            xdot = f + g*u;
-
-            % States -- Euler aproximation of integration
-            states(idx+1,:) = states(idx,:) + period*xdot';
-
-            % Return
-            newState = states;
-        end
-        
-        function [rho, gamma] = ModelEq(states, signals, idx, period)
-            % Set constants
-            m   = 1.3872;
-            g   = 9.8100;
-            l   = 0.1860;
-            Bp  = 0.8000;
-            By  = 0.3180;
-            Jp  = 0.0384;
-            Jy  = 0.0432;
-            Kpp = 0.2040;
-            Kyy = 0.0720;
-            Kyp = 0.0219;
-            Kpy = 0.0068;
-
-            % States
-            x1 = states(idx,1);
-            x2 = states(idx,2);
-            x4 = states(idx,4);
-
-            % Differential Equations (Nonlinear model)
-            % Representation in state variables
-            f1 = -(Bp*x2 + m*(x2*l)^2*sin(x1)*cos(x1) + m*g*l*cos(x1))/(Jp + m*l^2);
-            f2 = -(By*x4 + 2*m*sin(x1)*cos(x1)*x2*x4*l^2)/(Jy + m*(l*cos(x1))^2);
-
-            g11 = Kpp/(Jp + m*l^2);
-            g12 = Kpy/(Jp + m*l^2);
-            g21 = Kyp/(Jy + m*(l*cos(x1))^2);
-            g22 = Kyy/(Jy + m*(l*cos(x1))^2);
-
-            f = [x2; f1; x4; f2];
-            g = [0,0; g11,g12; 0,0; g21,g22];
-            u = [signals(1); signals(2)];
             
-            % Return            
-            rho = states(idx,:) + f'*period;    rho = rho(1:2);
-            gamma = (g*period*u)';              gamma = gamma(1:2);
-        end
-        
-        %{
-            Estimate the angular accelerations of the helicopter from its nonlinear mode.
-
-            @params double $theta       Angular position for pitch axis
-                    array  $dots        Angular speed for each axis
-                    array  $signals     Control signals
-                    double $idx         Iteration value
-                    double $period      Sampling time
-            @return array  $newState    Angular accelarations estimated about each axis
-        %}
-        function newState = LinearModel(states, signals, idx, period)
-            % Set constants
-            m   = 1.3872;
-            g   = 9.8100;
-            l   = 0.1860;
-            Bp  = 0.8000;
-            By  = 0.3180;
-            Jp  = 0.0384;
-            Jy  = 0.0432;
-            Kpp = 0.2040;
-            Kyy = 0.0720;
-            Kyp = 0.0219;
-            Kpy = 0.0068;
+            % Indices a parametric disturbance at tDisturbance seconds
+            if period*idx >= tDisturbance
+                m = 1.5*m;
+                Jp = 1.5*Jp;
+            end
 
             % States
             x1 = states(idx,1);
@@ -781,6 +696,10 @@ classdef Application < handle
 
             % Return
             newState = states;
+            rho = states(idx,:) + f'*period;
+            rho = rho([2 4]);
+            gamma = (g*period*u)';
+            gamma = gamma([2 4]);
         end
         
         %{
@@ -808,8 +727,8 @@ classdef Application < handle
         %}
         function [y, rho, gamma] = getOutputFilters(backs, forwards, zMemory, yMemory, pSignal)
             gamma = sum(backs * zMemory);
-            rho = sum(pSignal*forwards*yMemory);
-            y = gamma + rho;
+            rho = sum(forwards*yMemory);
+            y = gamma + rho*pSignal;
         end
         
         %{
@@ -846,9 +765,9 @@ classdef Application < handle
             kp = gains(1);      ki = gains(2);      kd = gains(3);
             mp = rates(1);      mi = rates(2);      md = rates(3);
 
-            kp = kp + mp*gamma*(epsilon(1) - epsilon(2));
-            ki = ki + mi*gamma*(epsilon(1));
-            kd = kd + md*gamma*(epsilon(1) - 2*epsilon(2) + epsilon(3));
+            kp = kp + mp*error*gamma*(epsilon(1) - epsilon(2));
+            ki = ki + mi*error*gamma*(epsilon(1));
+            kd = kd + md*error*gamma*(epsilon(1) - 2*epsilon(2) + epsilon(3));
 
             rst = abs([kp, ki, kd]);
         end
@@ -893,7 +812,7 @@ classdef Application < handle
         end
         
         %{
-            Calculate the output of the IIR filters.
+            Calculates the output of the IIR filters.
 
             @params array   $signals        Control signals for each axis
                     array   $tau            Values for wavelets
@@ -926,7 +845,16 @@ classdef Application < handle
         end
         
         %{
-        
+            Calculates the gradients for Actor stage.
+
+            @params array   $signals        Control signals for each axis
+                    array   $error          Estimatio error array
+                    matrix  $feedbacks      Feedbacks coefficients matrix
+                    matrix  $fMemory        Memory array for wavelet functions
+                    matrix  $zMemory        Memory array for outputs the neural network 
+                    matrix  $yMemory        Memory array for position estimated
+                    double  $pSignal        Persistent signal for the IIR filters
+            @return matrix  $d{W,C,D}       Variation in each parameter
         %}
         function [dW, dC, dD] = gradientActorRL(signals, error, feedbacks, ...
                 fMemory, zMemory, yMemory, pSignal)
@@ -936,45 +864,19 @@ classdef Application < handle
         end
         
         %{
+            Calculates the gradients for Critic stage.
+
+            @params array   $signals        Control signals for each axis
+                    double  $TD             Temporal difference signal
+                    array   $omega          Synaptic weights
+                    array   $tau            Values for wavelets
+            @return matrix  $d{O,b,a}       Variation in each parameter
         %}
         function [dO, db, da] = gradientCriticRL(signals, TD, gamma, omega, func, dfunc, tau)
-            
             aux = TD*gamma*sum(signals);
-            
             dO = aux.*func;
             db = -aux.*(omega.*dfunc);
             da = tau.*db;
-        end
-        
-        %{
-            Verifies that the control signal is within the acceptaed range.
-
-            @params double  $signal         Input signal control
-                    double  $maxValue       Simulation time
-            @return double  $rst            Output signal control
-        %}
-        function rst = checkSignal(signal,maxValue)
-            if abs(signal) < maxValue
-                rst = signal;
-            else
-                if signal > 0
-                    rst = maxValue;
-                else
-                    rst = maxValue * -1;
-                end
-            end
-        end
-        
-        %{
-            Gets a normalized array or matrix
-        
-            @params array   $data       Array or matrix
-                    double  $infLimit   Inferior limit
-                    double  $supLimit   Superior limit
-            @return array   $rst
-        %}
-        function rst = normAB(data, infLimit, supLimit)
-            rst = infLimit + (data - min(data)).*(supLimit - infLimit)./(max(data) - min(data));
         end
     end % of static methods
 end
